@@ -64,10 +64,11 @@ public final class VoxCPM2TTSPackage: ModelPackage {
 
     public func load() async throws {
         guard loaded == nil else { return }
-        // Download (or reuse the cached) HF snapshot, then load weights + tokenizer.
-        // (Redirecting the download into the engine's chosen models folder is a follow-up, as with
-        // Kokoro — it depends on threading a custom Hub download base through here.)
-        let directory = try await HubApi.shared.snapshot(from: configuration.repo)
+        // Download (or reuse the cached) HF snapshot, then load weights + tokenizer. When the engine
+        // has set a model-store root, point the Hub download base there (the caller holds
+        // security-scoped access) so weights land in the chosen models folder, not the default cache.
+        let hub = configuration.modelsRootDirectory.map { HubApi(downloadBase: $0) } ?? .shared
+        let directory = try await hub.snapshot(from: configuration.repo)
         let result = try await ModelLoader.load(from: directory)
 
         // Weight-parity gate (the heart of "use the HF weights"): the core loader filters weights

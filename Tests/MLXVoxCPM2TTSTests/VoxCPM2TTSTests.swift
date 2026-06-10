@@ -48,4 +48,26 @@ struct VoxCPM2TTSTests {
         #expect(wav[8..<12] == Data("WAVE".utf8))
         #expect(wav[36..<40] == Data("data".utf8))
     }
+
+    @Test func referenceAudioDecodesMonoRoundTrip() throws {
+        // encode → canonical Audio → decodeToMono recovers samples + rate (the .referenceAudio
+        // ingest path; AVFoundation decode, so any valid WAV layout works).
+        let samples: [Float] = (0..<2400).map { sin(Float($0) * 0.05) * 0.7 }
+        let wav = VoxCPM2TTSPackage.encodeWAV16(samples: samples, sampleRate: 24_000)
+        let audio = Audio(format: .wav, data: wav, sampleRate: 24_000, channels: 1)
+
+        let (decoded, rate) = try VoxCPM2TTSPackage.decodeToMono(audio)
+        #expect(rate == 24_000)
+        #expect(decoded.count == samples.count)
+        for (a, b) in zip(decoded, samples) {
+            #expect(abs(a - b) < 0.001) // 16-bit quantization tolerance
+        }
+    }
+
+    @Test func unreadableReferenceAudioThrowsTypedError() {
+        let junk = Audio(format: .wav, data: Data([0x00, 0x01, 0x02]))
+        #expect(throws: VoxCPM2Error.self) {
+            _ = try VoxCPM2TTSPackage.decodeToMono(junk)
+        }
+    }
 }

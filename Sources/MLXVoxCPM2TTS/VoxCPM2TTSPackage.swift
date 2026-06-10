@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 import MLXToolKit
 import MLX
 import Hub
@@ -11,6 +12,8 @@ public enum VoxCPM2Error: Error, Equatable {
     /// The loaded checkpoint left model parameters unfilled — wrong/incompatible weights. Carries
     /// the count and a few example keys for diagnosis.
     case incompatibleWeights(missing: Int, examples: [String])
+    /// The `.referenceAudio` clip couldn't be decoded into samples.
+    case unreadableReferenceAudio(String)
 }
 
 /// An MLXEngine `tts` package over **VoxCPM2** — a flow-matching TTS (TSLM → FSQ → RALM →
@@ -21,9 +24,20 @@ public enum VoxCPM2Error: Error, Equatable {
 /// weights in with `load()` (downloads the HF snapshot on first run, then validates weight-key
 /// parity), drives `run(_:)`, and reclaims with `unload()`. Returns the canonical `Audio` (.wav).
 ///
-/// **v1 is zero-shot only.** Reference-audio cloning and text-driven voice design are supported
-/// by the underlying engine but not yet exposed here; any `VoiceSelector` falls back to the
-/// model's default (zero-shot) voice.
+/// ## Voice selection
+///
+/// - `.auto` (and `.named` — VoxCPM2 has no named voices) → zero-shot synthesis.
+/// - `.referenceAudio(clip)` → **reference-only cloning**: the clip's timbre/style conditions
+///   generation via the VoxCPM2 ref prefix (`[103, ref…, 104, text…, 101]`); no transcript needed.
+/// - `.referenceAudio(clip)` + `referenceTranscript` → **continuation cloning** (the official
+///   "Ultimate Cloning"): tokens = `tokenizer(transcript + text)` with the clip as prompt audio;
+///   the model warm-starts from real audio features and the result is the highest-fidelity clone.
+///   `referenceTranscript` is the canonical `TTSRequest` field (contract 1.1.0).
+///
+/// Tokenization note: the MiniCPM tokenizer config sets `add_bos_token`, but VoxCPM2 was
+/// trained without a BOS before the text — encoding with special tokens shifts every position
+/// and causes onset artifacts (the bug fixed in our mlx-audio contribution, commit c7c79b8).
+/// All paths here encode with `addSpecialTokens: false`.
 @InferenceActor
 public final class VoxCPM2TTSPackage: ModelPackage {
     public typealias Configuration = VoxCPM2Configuration
@@ -48,7 +62,8 @@ public final class VoxCPM2TTSPackage: ModelPackage {
             surfaces: [
                 TTSContract.descriptor(
                     name: "voxcpm2-tts",
-                    summary: "VoxCPM2 flow-matching text-to-speech (48 kHz .wav), zero-shot.",
+                    summary: "VoxCPM2 flow-matching text-to-speech (48 kHz .wav): zero-shot, "
+                        + "reference-audio timbre cloning, and continuation cloning with transcript.",
                     modes: [.neutral, .expressive]
                 )
             ]
@@ -94,22 +109,103 @@ public final class VoxCPM2TTSPackage: ModelPackage {
         }
         try Task.checkCancellation()
 
-        // Zero-shot: tokenize text exactly as the reference harness does (the model appends its
-        // own audio-start token internally). Voice selection is ignored in v1.
-        let tokens = loaded.tokenizer.encode(text: tts.text)
-        let inputIds = MLXArray(tokens.map { Int32($0) })
+        // No BOS, ever — see the tokenization note in the type doc.
+        func tokenize(_ text: String) -> MLXArray {
+            MLXArray(loaded.tokenizer.encode(text: text, addSpecialTokens: false).map { Int32($0) })
+        }
 
-        let result = loaded.model.generate(
-            inputIds: inputIds,
-            inferenceTimesteps: configuration.inferenceTimesteps,
-            cfgValue: configuration.cfgValue,
-            temperature: configuration.temperature
-        )
+        let result: VoxCPMGenerationResult
+        switch tts.voice.selection {
+        case .auto, .named:
+            // Zero-shot. VoxCPM2 has no named-voice catalog; `.named` falls back to zero-shot.
+            result = loaded.model.generate(
+                inputIds: tokenize(tts.text),
+                inferenceTimesteps: configuration.inferenceTimesteps,
+                cfgValue: configuration.cfgValue,
+                temperature: configuration.temperature
+            )
 
+        case .referenceAudio(let reference):
+            // Decode the canonical clip and resample to the AudioVAE encoder rate (16 kHz).
+            let encodeRate = loaded.model.audioVae.sampleRate
+            let (decoded, sourceRate) = try Self.decodeToMono(reference)
+            let refSamples = sourceRate == encodeRate
+                ? decoded
+                : SincResampler.resample(audio: decoded, from: sourceRate, to: encodeRate)
+            let refAudio = MLXArray(refSamples)
+            try Task.checkCancellation()
+
+            if let transcript = tts.referenceTranscript, !transcript.isEmpty {
+                // Continuation ("Ultimate Cloning"): tokens are tokenizer(transcript + text) —
+                // direct concatenation, matching the reference implementations — with the clip
+                // as prompt audio warm-starting the autoregressive loop. The returned audio is
+                // only the newly-generated continuation (the core never decodes the prompt).
+                result = loaded.model.generate(
+                    inputIds: tokenize(transcript + tts.text),
+                    promptAudio: refAudio,
+                    inferenceTimesteps: configuration.inferenceTimesteps,
+                    cfgValue: configuration.cfgValue,
+                    temperature: configuration.temperature
+                )
+            } else {
+                // Reference-only: timbre/style cloning via the VoxCPM2 ref prefix; the text is
+                // unrelated to the clip, so no transcript is required.
+                result = loaded.model.generate(
+                    inputIds: tokenize(tts.text),
+                    refAudio: refAudio,
+                    inferenceTimesteps: configuration.inferenceTimesteps,
+                    cfgValue: configuration.cfgValue,
+                    temperature: configuration.temperature
+                )
+            }
+        }
+
+        try Task.checkCancellation()
         let samples = result.audio.asType(.float32).asArray(Float.self) // 1-D mono, 48 kHz
         let sampleRate = result.sampleRate
         let wav = Self.encodeWAV16(samples: samples, sampleRate: sampleRate)
         return TTSResponse(audio: Audio(format: .wav, data: wav, sampleRate: sampleRate, channels: 1))
+    }
+
+    // MARK: - Canonical Audio decode (serialized round-trip form, C3)
+
+    /// Decodes a canonical `Audio` (.wav) artifact to mono float samples + sample rate.
+    /// Multi-channel input is mixed down by averaging. Uses AVFoundation so any valid WAV
+    /// layout (extra chunks, float PCM) decodes, not just the canonical 44-byte header.
+    nonisolated static func decodeToMono(_ audio: Audio) throws -> (samples: [Float], sampleRate: Int) {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voxcpm2-ref-\(UUID().uuidString).wav")
+        try audio.data.write(to: tmp)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let file: AVAudioFile
+        do {
+            file = try AVAudioFile(forReading: tmp)
+        } catch {
+            throw VoxCPM2Error.unreadableReferenceAudio(error.localizedDescription)
+        }
+        let format = file.processingFormat
+        let frames = AVAudioFrameCount(file.length)
+        guard frames > 0, let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else {
+            throw VoxCPM2Error.unreadableReferenceAudio("empty audio")
+        }
+        try file.read(into: buffer)
+
+        let channels = Int(format.channelCount)
+        let count = Int(buffer.frameLength)
+        guard channels > 0, count > 0, let channelData = buffer.floatChannelData else {
+            throw VoxCPM2Error.unreadableReferenceAudio("no decodable samples")
+        }
+        var mono = [Float](repeating: 0, count: count)
+        for channel in 0..<channels {
+            let p = channelData[channel]
+            for i in 0..<count { mono[i] += p[i] }
+        }
+        if channels > 1 {
+            let inv = 1 / Float(channels)
+            for i in 0..<count { mono[i] *= inv }
+        }
+        return (mono, Int(format.sampleRate))
     }
 
     /// Encodes mono float samples as a 16-bit PCM WAV (broadly playable) in memory.

@@ -2,10 +2,8 @@ import Foundation
 import MLXToolKit
 
 /// Init-time configuration for `VoxCPM2TTSPackage` (C9): which HF repo to load and the
-/// flow-matching generation defaults. Per-request text/voice ride the `TTSRequest`, not here.
-///
-/// v1 is zero-shot only; reference-audio cloning and text-driven voice design are follow-ups,
-/// so this carries no voice/reference fields yet.
+/// flow-matching generation defaults. Per-request text/voice/reference ride the `TTSRequest`
+/// envelope (`VoiceSelector.referenceAudio` + `referenceTranscript`), not here.
 public struct VoxCPM2Configuration: PackageConfiguration, ModelStorable {
     /// HuggingFace repo in the MLX VoxCPM2 layout (config.json + sharded safetensors + tokenizer).
     public var repo: String

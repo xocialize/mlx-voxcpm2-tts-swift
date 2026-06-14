@@ -7,7 +7,7 @@ AudioVAE) producing 48 kHz speech on Apple silicon.
 It's a thin conformance wrapper: all model logic lives in the standalone engine
 [`mlx-voxcpm-swift`](https://github.com/xocialize/mlx-voxcpm-swift) (product `VoxCPM`), which this
 package pins to a tagged release — mirroring how `mlx-qwen-llm-swift` wraps mlx-swift-lm and
-`mlx-kokoro-tts-swift` wraps mlx-audio-swift. This package adds the `ModelPackage` conformance: the
+`mlx-kokoro-tts-swift` wraps kokoro-mlx-swift. This package adds the `ModelPackage` conformance: the
 `PackageManifest`, the HF download, a **weight-parity gate**, and the canonical `TTSRequest` →
 `Audio` (.wav) mapping. The `MLXServeEngine` coordinator handles licensing, device eligibility, and
 memory budgeting.
@@ -43,8 +43,9 @@ voice selection currently falls back to the default zero-shot voice.
 
 ## Development
 
-Co-developed in the MLXEngine workspace: depends on the engine contract (`MLXToolKit`) via a local
-path and on the VoxCPM core via a tagged GitHub release. The Xcode workspace overrides the tagged
+Co-developed in the MLXEngine workspace: depends on the engine contract (`MLXToolKit`) via a
+tagged-URL net dependency (`.package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.3.0")`)
+and on the VoxCPM core via a tagged GitHub release. The Xcode workspace overrides the tagged
 core with the in-workspace copy for local development.
 
 ## License

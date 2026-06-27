@@ -18,7 +18,8 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.3.0"),
-        .package(url: "https://github.com/xocialize/mlx-voxcpm-swift.git", from: "0.1.1"),
+        // v0.2.0 carries the cachedRefFeat/cachedPromptFeat API used by the E1 prompt-feat cache.
+        .package(url: "https://github.com/xocialize/mlx-voxcpm-swift.git", from: "0.2.0"),
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.6"),
     ],

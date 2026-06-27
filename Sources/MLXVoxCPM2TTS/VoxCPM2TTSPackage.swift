@@ -72,6 +72,13 @@ public final class VoxCPM2TTSPackage: ModelPackage {
 
     private let configuration: Configuration
     private var loaded: ModelLoader.LoadResult?
+    // Prompt-feat reuse (E1): encoding a reference clip runs the AudioVAE encoder + patchify
+    // (`encodePromptAudio`) — the dominant per-call cloning cost. Long-form synthesis (e.g.
+    // TTSOrchestratorKit anchor-to-first-segment) sends the *same* reference for every chunk, so
+    // we memoize the encoded feature keyed by the reference bytes and pass it to the core as a
+    // cached feat, skipping decode + resample + encode on reuse. Safe to hold: InferenceActor
+    // serializes run() and the feature is read-only once eval'd.
+    private var cachedPromptFeat: (key: Int, feat: MLXArray)?
 
     public nonisolated init(configuration: Configuration) {
         self.configuration = configuration
@@ -100,6 +107,7 @@ public final class VoxCPM2TTSPackage: ModelPackage {
 
     public func unload() async {
         loaded = nil
+        cachedPromptFeat = nil
     }
 
     public func run(_ request: any CapabilityRequest) async throws -> any CapabilityResponse {
@@ -126,36 +134,47 @@ public final class VoxCPM2TTSPackage: ModelPackage {
             )
 
         case .referenceAudio(let reference):
-            // Decode the canonical clip and resample to the AudioVAE encoder rate (16 kHz).
-            let encodeRate = loaded.model.audioVae.sampleRate
-            let (decoded, sourceRate) = try Self.decodeToMono(reference)
-            let refSamples = sourceRate == encodeRate
-                ? decoded
-                : SincResampler.resample(audio: decoded, from: sourceRate, to: encodeRate)
-            let refAudio = MLXArray(refSamples)
+            // Encode the reference once and reuse it across repeats (E1). The encoded feat is a
+            // pure function of the clip bytes, so the same key serves both cloning modes.
+            let key = Self.promptKey(data: reference.data)
+            let promptFeat: MLXArray
+            if let cached = cachedPromptFeat, cached.key == key {
+                promptFeat = cached.feat
+            } else {
+                // Decode the canonical clip and resample to the AudioVAE encoder rate (16 kHz).
+                let encodeRate = loaded.model.audioVae.sampleRate
+                let (decoded, sourceRate) = try Self.decodeToMono(reference)
+                let refSamples = sourceRate == encodeRate
+                    ? decoded
+                    : SincResampler.resample(audio: decoded, from: sourceRate, to: encodeRate)
+                let feat = loaded.model.encodePromptAudio(MLXArray(refSamples))
+                eval(feat)  // materialize so reuse skips the encode graph, not just re-runs it
+                cachedPromptFeat = (key, feat)
+                promptFeat = feat
+            }
             try Task.checkCancellation()
 
             if let transcript = tts.referenceTranscript, !transcript.isEmpty {
                 // Continuation ("Ultimate Cloning"): tokens are tokenizer(transcript + text) —
-                // direct concatenation, matching the reference implementations — with the clip
-                // as prompt audio warm-starting the autoregressive loop. The returned audio is
+                // direct concatenation, matching the reference implementations — with the clip's
+                // encoded features warm-starting the autoregressive loop. The returned audio is
                 // only the newly-generated continuation (the core never decodes the prompt).
                 result = loaded.model.generate(
                     inputIds: tokenize(transcript + tts.text),
-                    promptAudio: refAudio,
                     inferenceTimesteps: configuration.inferenceTimesteps,
                     cfgValue: configuration.cfgValue,
-                    temperature: configuration.temperature
+                    temperature: configuration.temperature,
+                    cachedPromptFeat: promptFeat
                 )
             } else {
                 // Reference-only: timbre/style cloning via the VoxCPM2 ref prefix; the text is
                 // unrelated to the clip, so no transcript is required.
                 result = loaded.model.generate(
                     inputIds: tokenize(tts.text),
-                    refAudio: refAudio,
                     inferenceTimesteps: configuration.inferenceTimesteps,
                     cfgValue: configuration.cfgValue,
-                    temperature: configuration.temperature
+                    temperature: configuration.temperature,
+                    cachedRefFeat: promptFeat
                 )
             }
         }
@@ -165,6 +184,16 @@ public final class VoxCPM2TTSPackage: ModelPackage {
         let sampleRate = result.sampleRate
         let wav = Self.encodeWAV16(samples: samples, sampleRate: sampleRate)
         return TTSResponse(audio: Audio(format: .wav, data: wav, sampleRate: sampleRate, channels: 1))
+    }
+
+    // MARK: - Prompt-feat cache key (E1)
+
+    /// In-memory cache key for an encoded reference: the clip bytes. (Hasher is per-process
+    /// seeded — fine, reuse happens within a single long-form run.)
+    nonisolated static func promptKey(data: Data) -> Int {
+        var hasher = Hasher()
+        hasher.combine(data)
+        return hasher.finalize()
     }
 
     // MARK: - Canonical Audio decode (serialized round-trip form, C3)

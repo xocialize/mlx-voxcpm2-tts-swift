@@ -37,9 +37,11 @@ let response = try await engine.run(TTSRequest(text: "Hello from VoxCPM2 on MLXE
 
 ## Status
 
-**v1 is zero-shot only.** The underlying engine also supports reference-audio voice cloning and
-text-driven voice design; exposing those through the canonical `VoiceSelector` is a follow-up. Any
-voice selection currently falls back to the default zero-shot voice.
+**Zero-shot and reference-audio cloning are supported.** `VoiceSelector.auto` (and `.named`, which
+VoxCPM2 has no catalog for) synthesize zero-shot. `.referenceAudio(clip)` clones the clip's timbre;
+adding `referenceTranscript` switches to continuation ("Ultimate Cloning") for the highest-fidelity
+result. Repeated references are encoded once and reused (prompt-feat cache), so long-form cloning
+doesn't re-pay the AudioVAE encode per chunk. Text-driven voice design is not yet exposed.
 
 ## Development
 

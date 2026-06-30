@@ -21,7 +21,9 @@ struct VoxCPM2TTSTests {
         #expect(r.chipFloor == .pro)
         #expect(r.os.minMacOS == SemanticVersion(major: 26, minor: 0, patch: 0))
         #expect(r.footprints.first?.quant == .bf16)
-        #expect(r.footprints.first?.residentBytes == 11_000_000_000)
+        // Split footprint (1.14 efficiency contract): measured weights floor + measured transient.
+        #expect(r.footprints.first?.residentBytes == 9_300_000_000)
+        #expect(r.footprints.first?.peakActivationBytes == 4_000_000_000)
     }
 
     @Test func registrationConstructs() throws {

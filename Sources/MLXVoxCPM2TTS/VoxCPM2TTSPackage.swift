@@ -49,9 +49,23 @@ public final class VoxCPM2TTSPackage: ModelPackage {
             provenance: Provenance(sourceRepo: "mlx-community/VoxCPM2-bf16", revision: "main", tier: 1),
             requirements: RequirementsManifest(
                 // ~2B params. The loader casts bf16 → float32 (Metal precision; see PORTING.md in
-                // the core), so weights alone are ~10 GB resident; budget headroom for the KV cache
-                // and the per-patch DiT/VAE activations puts the working set near ~11 GB.
-                footprints: [QuantFootprint(quant: .bf16, residentBytes: 11_000_000_000)],
+                // the core), so the weights are the dominant resident term. Split per contract 1.14
+                // (memory-harness.md): persistent weights in `residentBytes`, the transient (the
+                // max of the autoregressive TSLM generation scratch and the diffusion LocDiT/AudioVAE
+                // decode peak within one generate() call) in `peakActivationBytes` — the engine
+                // reserves a single transient across residents.
+                //
+                // MEASURED ("measure the transient, don't derive it") via the package's own gated
+                // bench (`VoxCPM2MemoryReport`, VX2_MEM=1) at a documented synth envelope — zero-shot,
+                // ~154 chars → ~9 s of 48 kHz audio, 10 ODE steps: resident floor ~8.7 GB · worst
+                // peak ~11.9 GB ⇒ transient ~3.2 GB. The old flat 11 GB *under-declared* the true
+                // peak (≈11.9 GB) — the split is a correctness fix as much as an efficiency one.
+                // Declared: weights 9.3 GB (measured floor) + transient 4.0 GB (~3.2 GB + ~20%
+                // headroom) → a ~13.3 GB reserve, vs the old flat 11 GB that the peak overran.
+                footprints: [QuantFootprint(
+                    quant: .bf16,
+                    residentBytes: 9_300_000_000,
+                    peakActivationBytes: 4_000_000_000)],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
                 // Heavy autoregressive + diffusion lift — a capability floor as a sanity marker;

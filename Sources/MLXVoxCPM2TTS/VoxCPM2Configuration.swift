@@ -4,7 +4,17 @@ import MLXToolKit
 /// Init-time configuration for `VoxCPM2TTSPackage` (C9): which HF repo to load and the
 /// flow-matching generation defaults. Per-request text/voice/reference ride the `TTSRequest`
 /// envelope (`VoiceSelector.referenceAudio` + `referenceTranscript`), not here.
-public struct VoxCPM2Configuration: PackageConfiguration, ModelStorable {
+///
+/// **QuantConfigured (1.14 efficiency contract).** VoxCPM2 ships a single bf16 runtime, so the
+/// quant alone identifies the footprint — `QuantConfigured` lets the governor charge the matching
+/// declared `QuantFootprint` split (no per-mode `FootprintConfigured` needed; there is no second
+/// variant at the same quant to disambiguate).
+public struct VoxCPM2Configuration: PackageConfiguration, ModelStorable, QuantConfigured {
+    /// The single runtime quant. The loader casts bf16 → float32 for Metal precision (see the
+    /// core's PORTING.md), but the *configured* quant — what the manifest footprint is keyed on —
+    /// is bf16.
+    public var quant: Quant { .bf16 }
+
     /// HuggingFace repo in the MLX VoxCPM2 layout (config.json + sharded safetensors + tokenizer).
     public var repo: String
     /// Euler ODE steps per latent patch (VoxCPM default 10; 7 trades a little quality for speed).

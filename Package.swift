@@ -17,7 +17,8 @@ let package = Package(
         .library(name: "MLXVoxCPM2TTS", targets: ["MLXVoxCPM2TTS"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.3.0"),
+        // Bumped to 0.15.0 (contract 1.14.0) for the split-footprint efficiency contract.
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.15.0"),
         // v0.2.0 carries the cachedRefFeat/cachedPromptFeat API used by the E1 prompt-feat cache.
         .package(url: "https://github.com/xocialize/mlx-voxcpm-swift.git", from: "0.2.0"),
         .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),

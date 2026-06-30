@@ -122,6 +122,7 @@ public final class VoxCPM2TTSPackage: ModelPackage {
     public func unload() async {
         loaded = nil
         cachedPromptFeat = nil
+        MLX.Memory.clearCache()   // release the retained MLX pool so eviction frees RSS (not just drop refs)
     }
 
     public func run(_ request: any CapabilityRequest) async throws -> any CapabilityResponse {

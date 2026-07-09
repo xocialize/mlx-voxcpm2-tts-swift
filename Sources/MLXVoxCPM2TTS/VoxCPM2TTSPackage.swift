@@ -2,7 +2,6 @@ import Foundation
 import AVFoundation
 import MLXToolKit
 import MLX
-import Hub
 import Tokenizers
 import VoxCPM
 
@@ -14,6 +13,9 @@ public enum VoxCPM2Error: Error, Equatable {
     case incompatibleWeights(missing: Int, examples: [String])
     /// The `.referenceAudio` clip couldn't be decoded into samples.
     case unreadableReferenceAudio(String)
+    /// Weight sources are missing and there is no store root (or resolved directory) to
+    /// materialize into.
+    case missingWeights(String)
 }
 
 /// An MLXEngine `tts` package over **VoxCPM2** — a flow-matching TTS (TSLM → FSQ → RALM →
@@ -100,11 +102,24 @@ public final class VoxCPM2TTSPackage: ModelPackage {
 
     public func load() async throws {
         guard loaded == nil else { return }
-        // Download (or reuse the cached) HF snapshot, then load weights + tokenizer. When the engine
-        // has set a model-store root, point the Hub download base there (the caller holds
-        // security-scoped access) so weights land in the chosen models folder, not the default cache.
-        let hub = configuration.modelsRootDirectory.map { HubApi(downloadBase: $0) } ?? .shared
-        let directory = try await hub.snapshot(from: configuration.repo)
+
+        // Auto-materialize missing sources into the engine store (dir-less configs only;
+        // explicit directories never touch the network). Progress is forwarded per-file via
+        // WeightDownloadProgress so the engine's PreparationMonitor surfaces `.downloading`.
+        let storeRoot = configuration.modelsRootDirectory
+        let missing = configuration.missingWeightSources(storeRoot: storeRoot)
+        if !missing.isEmpty {
+            guard let storeRoot else {
+                throw VoxCPM2Error.missingWeights(
+                    "no models root set and sources missing: \(missing.map(\.role).joined(separator: ", "))")
+            }
+            try await WeightMaterializer.materialize(missing, into: storeRoot)
+        }
+        try Task.checkCancellation()
+
+        guard let directory = configuration.resolved(storeRoot: storeRoot).modelDirectory else {
+            throw VoxCPM2Error.missingWeights("unresolved model directory (no store root)")
+        }
         let result = try await ModelLoader.load(from: directory)
 
         // Weight-parity gate (the heart of "use the HF weights"): the core loader filters weights

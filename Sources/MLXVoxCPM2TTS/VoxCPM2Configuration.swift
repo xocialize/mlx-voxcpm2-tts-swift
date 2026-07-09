@@ -23,23 +23,82 @@ public struct VoxCPM2Configuration: PackageConfiguration, ModelStorable, QuantCo
     public var cfgValue: Float
     /// Flow-matching noise temperature (nominal 1.0).
     public var temperature: Float
-    /// Where weights are materialized. Set by the engine from its `ModelStore`; `nil` → the default
-    /// swift-transformers cache. Excluded from `Codable` (environment-specific, not portable config).
+    /// Explicit snapshot directory (dev escape hatch — never touches the network).
+    public var modelDirectory: URL?
+    /// Engine-chosen models root (auto-materialization target). Set by the engine from its
+    /// `ModelStore`. Excluded from `Codable` (environment-specific, not portable config).
     public var modelsRootDirectory: URL?
 
     public init(repo: String = "mlx-community/VoxCPM2-bf16",
                 inferenceTimesteps: Int = 10,
                 cfgValue: Float = 2.0,
                 temperature: Float = 1.0,
+                modelDirectory: URL? = nil,
                 modelsRootDirectory: URL? = nil) {
         self.repo = repo
         self.inferenceTimesteps = inferenceTimesteps
         self.cfgValue = cfgValue
         self.temperature = temperature
+        self.modelDirectory = modelDirectory
         self.modelsRootDirectory = modelsRootDirectory
     }
 
     private enum CodingKeys: String, CodingKey {
         case repo, inferenceTimesteps, cfgValue, temperature
+    }
+}
+
+// MARK: - Weight sources (auto-materialization, engine MAT gate)
+
+extension VoxCPM2Configuration: WeightSourcing {
+    /// Presence probe: what `ModelLoader.load(from:)` reads first — config, the shard index
+    /// (which names the safetensors shards), and the tokenizer pair.
+    static let requiredFiles = [
+        "config.json", "model.safetensors.index.json", "tokenizer.json", "tokenizer_config.json",
+    ]
+    /// Download globs — the loadable snapshot (shards via `model*.safetensors`), skipping the
+    /// repo's README/sample wavs.
+    static let snapshotGlobs = [
+        "config.json", "model*.safetensors", "model.safetensors.index.json",
+        "tokenizer*.json", "special_tokens_map.json",
+    ]
+
+    public var weightSources: [WeightSource] {
+        [WeightSource(role: "main", repo: repo, matching: Self.snapshotGlobs)]
+    }
+
+    public func missingWeightSources(storeRoot: URL?) -> [WeightSource] {
+        let fm = FileManager.default
+        // Explicit local directory first (dev escape hatch).
+        if let dir = modelDirectory,
+           fm.fileExists(atPath: dir.appending(path: "config.json").path) {
+            return []
+        }
+        // Then the ModelStore layout (`<root>/<org>/<name>`).
+        if let dir = ModelStore(root: storeRoot).directory(for: repo),
+           Self.requiredFiles.allSatisfy({ fm.fileExists(atPath: dir.appending(path: $0).path) }) {
+            return []
+        }
+        return weightSources
+    }
+
+    /// The configuration with a nil `modelDirectory` resolved to the store layout — what `load()`
+    /// uses AFTER materialization. An explicit directory always wins.
+    public func resolved(storeRoot: URL?) -> VoxCPM2Configuration {
+        var cfg = self
+        if cfg.modelDirectory == nil {
+            cfg.modelDirectory = ModelStore(root: storeRoot).directory(for: repo)
+        }
+        return cfg
+    }
+}
+
+// MARK: - Cold-start prewarm
+
+extension VoxCPM2Configuration: WeightPrewarming {
+    public var prewarmPaths: [URL] {
+        // Store-resolved snapshot directory; the prewarmer scans it recursively for weight files
+        // and skips it when absent (first launch — nothing on disk yet).
+        [resolved(storeRoot: modelsRootDirectory).modelDirectory].compactMap { $0 }
     }
 }

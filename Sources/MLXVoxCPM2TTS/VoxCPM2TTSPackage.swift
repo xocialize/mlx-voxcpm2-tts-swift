@@ -141,11 +141,16 @@ public final class VoxCPM2TTSPackage: ModelPackage {
     }
 
     public func run(_ request: any CapabilityRequest) async throws -> any CapabilityResponse {
+        // CAN-1: the entry checkpoint is the FIRST act of run() — before notLoaded validation
+        // (engine ≥ 0.27.0). Mid-run cadence: the core's autoregressive patch loop bails once
+        // per generated patch (`Task.isCancelled` break, mlx-voxcpm-swift ≥ 0.3.0 — the
+        // TSLM/RALM/LocDiT interleave cadence) and the post-synthesis checkpoint below rethrows
+        // the CancellationError unchanged (generate() is non-throwing by design).
+        try Task.checkCancellation()
         guard let loaded else { throw PackageError.notLoaded }
         guard request.capability == .tts, let tts = request as? TTSRequest else {
             throw PackageError.unsupportedCapability(request.capability)
         }
-        try Task.checkCancellation()
 
         // No BOS, ever — see the tokenization note in the type doc.
         func tokenize(_ text: String) -> MLXArray {
@@ -209,6 +214,9 @@ public final class VoxCPM2TTSPackage: ModelPackage {
             }
         }
 
+        // Post-synthesis checkpoint: the throwing half of the non-throwing-core pattern — if
+        // the core's per-patch bail broke out early, this surfaces the CancellationError
+        // unchanged (and discards the partial audio) before the CPU sample pull + WAV encode.
         try Task.checkCancellation()
         let samples = result.audio.asType(.float32).asArray(Float.self) // 1-D mono, 48 kHz
         let sampleRate = result.sampleRate

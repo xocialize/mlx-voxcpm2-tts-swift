@@ -74,7 +74,11 @@ public final class VoxCPM2TTSPackage: ModelPackage {
                 // the MemoryGovernor still gates on the ~11 GB footprint.
                 chipFloor: .pro
             ),
-            specialties: [],
+            specialties: [
+                // Zero-shot voice cloning is VoxCPM2's core selection axis (shared with
+                // IndexTTS2 / Qwen3-TTS / Gepard); no native emotion/duration control plane.
+                SpecialtyWeight(.voiceClone, strength: 1.0),
+            ],
             surfaces: [
                 TTSContract.descriptor(
                     name: "voxcpm2-tts",

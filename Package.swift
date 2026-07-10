@@ -17,9 +17,10 @@ let package = Package(
         .library(name: "MLXVoxCPM2TTS", targets: ["MLXVoxCPM2TTS"]),
     ],
     dependencies: [
-        // Bumped to 0.27.0 for the CAN cancellation-conformance gate
+        // Bumped to 0.28.1 for Specialty.voiceClone (VoxCPM2's zero-shot cloning selection
+        // axis); 0.27.0 brought the CAN cancellation-conformance gate
         // (MLXServeConformance.CancellationConformance).
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.27.0"),
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.28.1"),
         // v0.3.0 carries the per-patch cooperative cancellation bail in the autoregressive
         // loop (CAN gate); v0.2.0 added the cachedRefFeat/cachedPromptFeat E1 API.
         .package(url: "https://github.com/xocialize/mlx-voxcpm-swift.git", from: "0.3.0"),

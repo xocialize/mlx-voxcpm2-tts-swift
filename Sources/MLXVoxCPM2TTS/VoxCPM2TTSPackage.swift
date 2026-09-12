@@ -83,8 +83,17 @@ public final class VoxCPM2TTSPackage: ModelPackage {
                 TTSContract.descriptor(
                     name: "voxcpm2-tts",
                     summary: "VoxCPM2 flow-matching text-to-speech (48 kHz .wav): zero-shot, "
-                        + "reference-audio timbre cloning, and continuation cloning with transcript.",
-                    modes: [.neutral, .expressive]
+                        + "reference-audio timbre cloning, and continuation cloning with transcript. "
+                        + "E12 typed plane: `emotion` as .textDescription (a style description, rendered "
+                        + "as the model's inline `(description)text` control) or .categorical over the "
+                        + "shared 8-name vocabulary, rendered to a description. No native duration control.",
+                    modes: [.neutral, .expressive],
+                    // E12 declaration (contract 1.38.0, AB-A-0049 part 3): VoxCPM2 honors inline
+                    // `(description)text` style control (listen-tested, ENHANCEMENTS E11), so both
+                    // declared modes become that prefix. No native duration control — consumers
+                    // time-stretch (E8 v2) for cue fit.
+                    controls: TTSControls(emotionModes: [.categorical, .textDescription],
+                                          supportsTargetDuration: false)
                 )
             ]
         )
@@ -156,6 +165,11 @@ public final class VoxCPM2TTSPackage: ModelPackage {
             throw PackageError.unsupportedCapability(request.capability)
         }
 
+        // E12 typed plane (contract 1.38.0): a typed emotion becomes the model's inline
+        // `(description)text` control on the text being generated — on every voice path, since
+        // the model card says voice design, style control and cloning compose (E11).
+        let text = try Self.controlledText(tts.text, emotion: tts.emotion)
+
         // No BOS, ever — see the tokenization note in the type doc.
         func tokenize(_ text: String) -> MLXArray {
             MLXArray(loaded.tokenizer.encode(text: text, addSpecialTokens: false).map { Int32($0) })
@@ -166,7 +180,7 @@ public final class VoxCPM2TTSPackage: ModelPackage {
         case .auto, .named:
             // Zero-shot. VoxCPM2 has no named-voice catalog; `.named` falls back to zero-shot.
             result = loaded.model.generate(
-                inputIds: tokenize(tts.text),
+                inputIds: tokenize(text),
                 inferenceTimesteps: configuration.inferenceTimesteps,
                 cfgValue: configuration.cfgValue,
                 temperature: configuration.temperature
@@ -199,7 +213,7 @@ public final class VoxCPM2TTSPackage: ModelPackage {
                 // encoded features warm-starting the autoregressive loop. The returned audio is
                 // only the newly-generated continuation (the core never decodes the prompt).
                 result = loaded.model.generate(
-                    inputIds: tokenize(transcript + tts.text),
+                    inputIds: tokenize(transcript + text),
                     inferenceTimesteps: configuration.inferenceTimesteps,
                     cfgValue: configuration.cfgValue,
                     temperature: configuration.temperature,
@@ -209,7 +223,7 @@ public final class VoxCPM2TTSPackage: ModelPackage {
                 // Reference-only: timbre/style cloning via the VoxCPM2 ref prefix; the text is
                 // unrelated to the clip, so no transcript is required.
                 result = loaded.model.generate(
-                    inputIds: tokenize(tts.text),
+                    inputIds: tokenize(text),
                     inferenceTimesteps: configuration.inferenceTimesteps,
                     cfgValue: configuration.cfgValue,
                     temperature: configuration.temperature,
@@ -311,5 +325,54 @@ extension VoxCPM2TTSPackage {
     /// The author one-liner the engine registers.
     public nonisolated static var registration: PackageRegistration {
         .of(VoxCPM2TTSPackage.self)
+    }
+}
+
+// MARK: - E12 typed plane → inline `(description)text`
+
+extension VoxCPM2TTSPackage {
+    /// The typed `TTSRequest.emotion` rendered as VoxCPM2's inline control: `(description)text`,
+    /// no separator — the form listen-tested in E11. `.textDescription` is used verbatim;
+    /// `.categorical` renders one canonical name to the style description below. `.vector` /
+    /// `.referenceAudio` are not declared, so the engine refuses them pre-admission and a direct
+    /// caller is refused here, legibly. No typed emotion = the text untouched (no metaData compat
+    /// path existed for this package; callers wrote the tags into the text themselves).
+    nonisolated static func controlledText(_ text: String, emotion: TTSEmotion?) throws -> String {
+        guard let emotion else { return text }
+        switch emotion {
+        case .textDescription(let description):
+            return "(\(description))\(text)"
+        case .categorical(let label):
+            guard let resolved = E12Emotion.resolve(label) else {
+                throw PackageError.unsupportedRequestFeature(
+                    "emotion '\(label)' — known: \(E12Emotion.knownLabels)")
+            }
+            return "(\(resolved.styleDescription))\(text)"
+        case .vector:
+            throw PackageError.unsupportedRequestFeature(
+                "emotion.vector — VoxCPM2 steers by an inline description; send .categorical or .textDescription")
+        case .referenceAudio:
+            throw PackageError.unsupportedRequestFeature(
+                "emotion.referenceAudio — VoxCPM2 steers by an inline description; send .categorical or .textDescription")
+        @unknown default:
+            throw PackageError.unsupportedRequestFeature("emotion — mode not known to this package")
+        }
+    }
+}
+
+extension E12Emotion {
+    /// The `(description)` each canonical category renders to — a delivery description in the
+    /// style the model card demonstrates, not a bare label.
+    public var styleDescription: String {
+        switch self {
+        case .happy: "cheerful and upbeat"
+        case .angry: "angry and forceful"
+        case .sad: "sad and subdued"
+        case .afraid: "fearful and nervous"
+        case .disgusted: "disgusted, with distaste"
+        case .melancholic: "slow and melancholic"
+        case .surprised: "surprised and astonished"
+        case .calm: "calm and even"
+        }
     }
 }

@@ -73,3 +73,40 @@ struct VoxCPM2TTSTests {
         }
     }
 }
+
+// MARK: - E12 typed plane (contract 1.38.0, AB-A-0049 part 3)
+
+@Suite struct E12ControlsTests {
+    @Test func declaresInlineDescriptionSteeringOnly() {
+        let surface = VoxCPM2TTSPackage.manifest.surfaces[0]
+        #expect(surface.ttsControls?.emotionModes == [.categorical, .textDescription])
+        #expect(surface.ttsControls?.supportsTargetDuration == false)
+        #expect(surface.parameters.contains { $0.name == "emotion" })
+        #expect(!surface.parameters.contains { $0.name == "targetDuration" })
+        #expect(surface.controlsMatchCapability)
+    }
+
+    @Test func typedEmotionBecomesTheInlineDescriptionPrefix() throws {
+        #expect(try VoxCPM2TTSPackage.controlledText("Hello.", emotion: .textDescription("in a whisper"))
+                == "(in a whisper)Hello.")
+        #expect(try VoxCPM2TTSPackage.controlledText("Hello.", emotion: .categorical("happy"))
+                == "(cheerful and upbeat)Hello.")
+        #expect(try VoxCPM2TTSPackage.controlledText("Hello.", emotion: .categorical("Neutral"))
+                == "(calm and even)Hello.")
+        #expect(try VoxCPM2TTSPackage.controlledText("Hello.", emotion: nil) == "Hello.")
+        #expect(E12Emotion.allCases.map(\.rawValue)
+                == ["happy", "angry", "sad", "afraid", "disgusted", "melancholic", "surprised", "calm"])
+    }
+
+    @Test func undeclaredModesAndUnknownLabelsAreRefusedLegibly() {
+        #expect(throws: PackageError.self) {
+            try VoxCPM2TTSPackage.controlledText("x", emotion: .categorical("ecstatic"))
+        }
+        #expect(throws: PackageError.self) {
+            try VoxCPM2TTSPackage.controlledText("x", emotion: .vector([0.2]))
+        }
+        #expect(throws: PackageError.self) {
+            try VoxCPM2TTSPackage.controlledText("x", emotion: .referenceAudio(Audio(data: Data())))
+        }
+    }
+}

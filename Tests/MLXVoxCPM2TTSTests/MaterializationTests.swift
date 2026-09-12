@@ -51,8 +51,10 @@ final class MaterializationTests: XCTestCase {
         let cfg = VoxCPM2Configuration()
         // Empty store: the source is missing.
         XCTAssertEqual(cfg.missingWeightSources(storeRoot: root).count, 1)
-        // Populate the expected layout.
-        let dir = root.appending(path: cfg.repo)
+        // Populate the expected layout — the path from ModelStore so the fixture tracks the
+        // engine's canonical models--org--name layout (contract 1.22.0), not a stale literal;
+        // the 0.28.1 → 0.54.0 pin bump exposed the `org/name` literal this used to build.
+        let dir = ModelStore(root: root).directory(for: cfg.repo)!
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         for f in VoxCPM2Configuration.requiredFiles {
             FileManager.default.createFile(atPath: dir.appending(path: f).path, contents: Data([0]))
@@ -69,7 +71,7 @@ final class MaterializationTests: XCTestCase {
         let root = URL(fileURLWithPath: "/tmp/some-store")
         let cfg = VoxCPM2Configuration(modelsRootDirectory: root)
         XCTAssertEqual(cfg.prewarmPaths.map(\.path),
-                       [root.appending(path: "mlx-community/VoxCPM2-bf16").path])
+                       [ModelStore(root: root).directory(for: "mlx-community/VoxCPM2-bf16")!.path])
     }
 
     func testCodableRoundTrip() throws {

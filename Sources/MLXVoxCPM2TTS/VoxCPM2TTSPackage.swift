@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import MLXToolKit
 import MLX
+import MLXRandom
 import Tokenizers
 import VoxCPM
 
@@ -35,6 +36,23 @@ public enum VoxCPM2Error: Error, Equatable {
 ///   "Ultimate Cloning"): tokens = `tokenizer(transcript + text)` with the clip as prompt audio;
 ///   the model warm-starts from real audio features and the result is the highest-fidelity clone.
 ///   `referenceTranscript` is the canonical `TTSRequest` field (contract 1.1.0).
+///
+/// ## metaData keys (package-specific, C5)
+///
+/// - `seed` (int): seeds MLX's global random state (clamped to 32 bits, the fleet's guard
+///   against runaway 64-bit seeds) right before generation, after any reference encode — so a
+///   seeded request reproduces byte for byte, whether its reference came from the cache or not.
+/// - `voiceCacheKey` (string) and `evictVoiceCacheKeys` (string or array of strings): below.
+///
+/// **Reference retention (MES Base §13 rules 4 and 6, AB-A-0251 — the mlx-qwen3-tts-swift 0.7.0
+/// API, AB-A-0233).** Without `metaData["voiceCacheKey"]`, nothing derived from the reference
+/// outlives the call. With a key (Gaea passes the MES asset id), the encoded prompt feature — a
+/// function of the clip bytes alone, serving both cloning modes — is kept under that key, at
+/// most `voiceCacheCapacity` keys, least recently used dropped first. A key that comes back
+/// with other bytes is rebuilt; identical bytes under another key, or under none, never hit an
+/// entry. `metaData["evictVoiceCacheKeys"]` drops keys before anything else runs (before the
+/// weights check); with empty `text` the request is an eviction alone and returns empty audio
+/// (a 44-byte WAV, zero samples, 48 kHz). `unload()` drops every key.
 ///
 /// Tokenization note: the MiniCPM tokenizer config sets `add_bos_token`, but VoxCPM2 was
 /// trained without a BOS before the text — encoding with special tokens shifts every position
@@ -101,13 +119,19 @@ public final class VoxCPM2TTSPackage: ModelPackage {
 
     private let configuration: Configuration
     private var loaded: ModelLoader.LoadResult?
-    // Prompt-feat reuse (E1): encoding a reference clip runs the AudioVAE encoder + patchify
-    // (`encodePromptAudio`) — the dominant per-call cloning cost. Long-form synthesis (e.g.
-    // TTSOrchestratorKit anchor-to-first-segment) sends the *same* reference for every chunk, so
-    // we memoize the encoded feature keyed by the reference bytes and pass it to the core as a
-    // cached feat, skipping decode + resample + encode on reuse. Safe to hold: InferenceActor
-    // serializes run() and the feature is read-only once eval'd.
-    private var cachedPromptFeat: (key: Int, feat: MLXArray)?
+    // Prompt-feat reuse (E1), held only under a caller's `voiceCacheKey` (AB-A-0251): encoding a
+    // reference clip runs the AudioVAE encoder + patchify (`encodePromptAudio`) — the dominant
+    // per-call cloning cost, and long-form synthesis sends the same reference for every chunk.
+    // Safe to hold: InferenceActor serializes run() and the feature is read-only once eval'd.
+    var voiceCache = VoiceFeatureCache<CachedPromptFeat>(capacity: voiceCacheCapacity)
+    /// Reference encodes since construction — observability for the cache tests.
+    private(set) var promptFeatBuilds = 0
+
+    /// How many `voiceCacheKey`s are kept at once.
+    public nonisolated static let voiceCacheCapacity = 4
+
+    /// The output rate (AudioVAE decode), for the eviction-only response that runs unloaded.
+    nonisolated static let outputSampleRate = 48_000
 
     public nonisolated init(configuration: Configuration) {
         self.configuration = configuration
@@ -149,7 +173,7 @@ public final class VoxCPM2TTSPackage: ModelPackage {
 
     public func unload() async {
         loaded = nil
-        cachedPromptFeat = nil
+        voiceCache.removeAll()
         MLX.Memory.clearCache()   // release the retained MLX pool so eviction frees RSS (not just drop refs)
     }
 
@@ -160,10 +184,21 @@ public final class VoxCPM2TTSPackage: ModelPackage {
         // TSLM/RALM/LocDiT interleave cadence) and the post-synthesis checkpoint below rethrows
         // the CancellationError unchanged (generate() is non-throwing by design).
         try Task.checkCancellation()
-        guard let loaded else { throw PackageError.notLoaded }
         guard request.capability == .tts, let tts = request as? TTSRequest else {
             throw PackageError.unsupportedCapability(request.capability)
         }
+
+        // Eviction first, and without weights: a key dropped on asset deletion must go even
+        // when the package isn't loaded (it then holds nothing, but the call still succeeds).
+        if let keys = tts.metaData.stringList("evictVoiceCacheKeys") {
+            for key in keys { voiceCache.remove(key) }
+            if tts.text.isEmpty {
+                return TTSResponse(audio: Audio(
+                    format: .wav, data: Self.encodeWAV16(samples: [], sampleRate: Self.outputSampleRate),
+                    sampleRate: Self.outputSampleRate, channels: 1))
+            }
+        }
+        guard let loaded else { throw PackageError.notLoaded }
 
         // E12 typed plane (contract 1.38.0): a typed emotion becomes the model's inline
         // `(description)text` control on the text being generated — on every voice path, since
@@ -173,6 +208,18 @@ public final class VoxCPM2TTSPackage: ModelPackage {
         // No BOS, ever — see the tokenization note in the type doc.
         func tokenize(_ text: String) -> MLXArray {
             MLXArray(loaded.tokenizer.encode(text: text, addSpecialTokens: false).map { Int32($0) })
+        }
+
+        // The reference's prompt feature first (from the caller's key, or encoded for this call),
+        // then the seed — so the RNG stream generation sees doesn't depend on the cache.
+        var promptFeat: MLXArray?
+        if case .referenceAudio(let reference) = tts.voice.selection {
+            let cacheKey = tts.metaData.stringValue("voiceCacheKey").flatMap { $0.isEmpty ? nil : $0 }
+            promptFeat = try encodedPrompt(reference, key: cacheKey, model: loaded.model)
+            try Task.checkCancellation()
+        }
+        if let seed = tts.metaData.intValue("seed") {
+            MLXRandom.seed(UInt64(bitPattern: Int64(seed)) & 0xFFFF_FFFF)
         }
 
         let result: VoxCPMGenerationResult
@@ -186,27 +233,8 @@ public final class VoxCPM2TTSPackage: ModelPackage {
                 temperature: configuration.temperature
             )
 
-        case .referenceAudio(let reference):
-            // Encode the reference once and reuse it across repeats (E1). The encoded feat is a
-            // pure function of the clip bytes, so the same key serves both cloning modes.
-            let key = Self.promptKey(data: reference.data)
-            let promptFeat: MLXArray
-            if let cached = cachedPromptFeat, cached.key == key {
-                promptFeat = cached.feat
-            } else {
-                // Decode the canonical clip and resample to the AudioVAE encoder rate (16 kHz).
-                let encodeRate = loaded.model.audioVae.sampleRate
-                let (decoded, sourceRate) = try Self.decodeToMono(reference)
-                let refSamples = sourceRate == encodeRate
-                    ? decoded
-                    : SincResampler.resample(audio: decoded, from: sourceRate, to: encodeRate)
-                let feat = loaded.model.encodePromptAudio(MLXArray(refSamples))
-                eval(feat)  // materialize so reuse skips the encode graph, not just re-runs it
-                cachedPromptFeat = (key, feat)
-                promptFeat = feat
-            }
-            try Task.checkCancellation()
-
+        case .referenceAudio:
+            guard let promptFeat else { preconditionFailure("encoded above") }
             if let transcript = tts.referenceTranscript, !transcript.isEmpty {
                 // Continuation ("Ultimate Cloning"): tokens are tokenizer(transcript + text) —
                 // direct concatenation, matching the reference implementations — with the clip's
@@ -242,10 +270,32 @@ public final class VoxCPM2TTSPackage: ModelPackage {
         return TTSResponse(audio: Audio(format: .wav, data: wav, sampleRate: sampleRate, channels: 1))
     }
 
-    // MARK: - Prompt-feat cache key (E1)
+    // MARK: - Reference prompt feature (E1, AB-A-0251)
 
-    /// In-memory cache key for an encoded reference: the clip bytes. (Hasher is per-process
-    /// seeded — fine, reuse happens within a single long-form run.)
+    /// The reference's encoded prompt feature: from the cache when `key` holds it for these
+    /// bytes, else encoded now — and kept only when there is a key. The feature is a pure
+    /// function of the clip bytes, so one entry serves both cloning modes.
+    private func encodedPrompt(_ reference: Audio, key: String?, model: VoxCPMModel) throws -> MLXArray {
+        let fingerprint = Self.promptKey(data: reference.data)
+        if let key, let cached = voiceCache.value(for: key), cached.fingerprint == fingerprint {
+            return cached.feat
+        }
+        // Decode the canonical clip and resample to the AudioVAE encoder rate (16 kHz).
+        let encodeRate = model.audioVae.sampleRate
+        let (decoded, sourceRate) = try Self.decodeToMono(reference)
+        let refSamples = sourceRate == encodeRate
+            ? decoded
+            : SincResampler.resample(audio: decoded, from: sourceRate, to: encodeRate)
+        let feat = model.encodePromptAudio(MLXArray(refSamples))
+        eval(feat)  // materialize so reuse skips the encode graph, not just re-runs it
+        promptFeatBuilds += 1
+        if let key { voiceCache.insert(CachedPromptFeat(fingerprint: fingerprint, feat: feat), for: key) }
+        return feat
+    }
+
+    /// Fingerprint of the reference bytes, so a key reused with other bytes re-encodes instead
+    /// of serving the old voice. Never a cache key on its own. In-memory only (Hasher is
+    /// per-process seeded).
     nonisolated static func promptKey(data: Data) -> Int {
         var hasher = Hasher()
         hasher.combine(data)
@@ -318,6 +368,30 @@ public final class VoxCPM2TTSPackage: ModelPackage {
             withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
         }
         return data
+    }
+}
+
+extension MetaData {
+    /// Convenience: read a string-valued metaData key.
+    func stringValue(_ key: String) -> String? {
+        if case .string(let value)? = self[key] { return value }
+        return nil
+    }
+
+    /// Convenience: read a string or an array of strings (e.g. keys to evict).
+    func stringList(_ key: String) -> [String]? {
+        switch self[key] {
+        case .string(let value)?: return [value]
+        case .array(let values)?:
+            return values.compactMap { if case .string(let v) = $0 { return v } else { return nil } }
+        default: return nil
+        }
+    }
+
+    /// Convenience: read an int-valued metaData key (e.g. the sampling seed).
+    func intValue(_ key: String) -> Int? {
+        if case .int(let value)? = self[key] { return value }
+        return nil
     }
 }
 

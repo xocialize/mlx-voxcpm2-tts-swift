@@ -21,11 +21,15 @@ let package = Package(
         // axis); 0.27.0 brought the CAN cancellation-conformance gate
         // (MLXServeConformance.CancellationConformance).
         // 0.54.0 ⊇ contract 1.38.0: the E12 controls plane (TTSControls + typed emotion/targetDuration).
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.54.0"),
+        // 0.74.1: the fleet's mlx-swift leak fix (AB-D-0208).
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.74.1"),
         // v0.3.0 carries the per-patch cooperative cancellation bail in the autoregressive
         // loop (CAN gate); v0.2.0 added the cachedRefFeat/cachedPromptFeat E1 API.
         .package(url: "https://github.com/xocialize/mlx-voxcpm-swift.git", from: "0.3.0"),
-        .package(url: "https://github.com/ml-explore/mlx-swift.git", from: "0.30.0"),
+        // The fleet's mlx-swift fork, as mlx-engine-swift 0.74.1 takes it: 0.32.4 is upstream 0.32.3 plus
+        // the _updateInternal leak fix (ml-explore/mlx-swift#501; AB-D-0208). A root line naming
+        // ml-explore's URL would win over the engine's and drop the fix.
+        .package(url: "https://github.com/xocialize/mlx-swift", from: "0.32.4"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.1.6"),
         // Native downloader for WeightSourcing auto-materialization.
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
@@ -37,6 +41,8 @@ let package = Package(
                 .product(name: "MLXToolKit", package: "mlx-engine-swift"),
                 .product(name: "VoxCPM", package: "mlx-voxcpm-swift"),
                 .product(name: "MLX", package: "mlx-swift"),
+                // metaData["seed"] seeds MLX's global random state before generation (AB-A-0251).
+                .product(name: "MLXRandom", package: "mlx-swift"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
                 .product(name: "HuggingFace", package: "swift-huggingface"),
             ],

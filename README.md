@@ -40,13 +40,32 @@ let response = try await engine.run(TTSRequest(text: "Hello from VoxCPM2 on MLXE
 **Zero-shot and reference-audio cloning are supported.** `VoiceSelector.auto` (and `.named`, which
 VoxCPM2 has no catalog for) synthesize zero-shot. `.referenceAudio(clip)` clones the clip's timbre;
 adding `referenceTranscript` switches to continuation ("Ultimate Cloning") for the highest-fidelity
-result. Repeated references are encoded once and reused (prompt-feat cache), so long-form cloning
-doesn't re-pay the AudioVAE encode per chunk. Text-driven voice design is not yet exposed.
+result. Text-driven voice design is not yet exposed.
+
+**Voice cache and seed (v0.6.0, AB-A-0251; the mlx-qwen3-tts-swift 0.7.0 API).** MES Base §13
+rules 4 and 6: without `metaData["voiceCacheKey"]` (a string; Gaea passes the MES asset id)
+nothing derived from the reference outlives the call. With a key, the encoded prompt feature
+(AudioVAE encode + patchify — a function of the clip bytes alone, serving both cloning modes) is
+kept under that key, at most `VoxCPM2TTSPackage.voiceCacheCapacity` (4) keys, least recently used
+dropped first, so long-form cloning doesn't re-pay the encode per chunk. Identical bytes under
+another key, or under none, never hit an entry; a key that comes back with other bytes is
+re-encoded. Before 0.6.0 the last reference was reused implicitly, keyed by its bytes; long-form
+callers now pass a key. To drop keys, run
+`TTSRequest(text: "", metaData: ["evictVoiceCacheKeys": .array([.string(assetId)])])` through
+`MLXServeEngine.run`: eviction runs first, before the weights check, and with empty text returns a
+44-byte WAV with no samples. `unload()` drops every key.
+
+`metaData["seed"]` (int, clamped to 32 bits) seeds MLX's random state right before generation,
+after any reference encode, so a seeded request reproduces byte for byte — zero-shot or cloned,
+keyed or not. Live tests: `VX2_CLONE=1 swift test --build-system swiftbuild --filter
+VoiceCloneLiveTests` (weights from `VX2_MODELS`, default `/Volumes/DEV_VOL1/Models/Models`; nothing
+is downloaded).
 
 ## Development
 
 Co-developed in the MLXEngine workspace: depends on the engine contract (`MLXToolKit`) via a
-tagged-URL net dependency (`.package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.3.0")`)
+tagged-URL net dependency (`.package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.74.1")`, which brings the
+fleet's mlx-swift fork with the leak fix, AB-D-0208)
 and on the VoxCPM core via a tagged GitHub release. The Xcode workspace overrides the tagged
 core with the in-workspace copy for local development.
 

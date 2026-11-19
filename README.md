@@ -64,8 +64,8 @@ is downloaded).
 ## Development
 
 Co-developed in the MLXEngine workspace: depends on the engine contract (`MLXToolKit`) via a
-tagged-URL net dependency (`.package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.74.1")`, which brings the
-fleet's mlx-swift fork with the leak fix, AB-D-0208)
+tagged-URL net dependency (`.package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.82.1")`, which brings the
+fleet's mlx-swift 0.33.1 fork: upstream 0.33.0 with the leak fix, AB-D-0208, and the M5 attention patch, AB-D-0264)
 and on the VoxCPM core via a tagged GitHub release. The Xcode workspace overrides the tagged
 core with the in-workspace copy for local development.
 
